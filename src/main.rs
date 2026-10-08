@@ -28,8 +28,9 @@ use feruca::{Collator, Tailoring};
 )]
 struct Cli {
     /// Sort key(s): KEY[:DIR] with DIR = asc|desc (default asc).
-    /// Keys: completed, timestamp, text, priority, due.
+    /// Keys: completed, timestamp, text, priority, due, project.
     /// Repeatable and comma-separable; order = priority.
+    /// Overrides the default chain (completed, priority, project, timestamp:desc).
     #[arg(
         short = 's',
         long = "sort",
@@ -41,6 +42,11 @@ struct Cli {
     /// Reverse the final order
     #[arg(short = 'r', long)]
     reverse: bool,
+
+    /// Skip line reordering; only normalize line contents
+    /// (or nothing at all together with --no-format-lines)
+    #[arg(long)]
+    no_sort: bool,
 
     /// Only reorder lines; leave each line's contents untouched
     /// (disables the default normalization, incl. done-prio stripping)
@@ -74,6 +80,7 @@ enum Field {
     Text,
     Priority,
     Due,
+    Project,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,6 +116,7 @@ impl FromStr for SortKey {
             "text" | "alphabetical" | "alphabetically" | "alpha" | "name" => Field::Text,
             "priority" | "prio" => Field::Priority,
             "due" => Field::Due,
+            "project" | "projects" | "tag" | "tags" => Field::Project,
             other => {
                 return Err(format!(
                     "unknown sort key '{other}' (completed, timestamp, text, priority, due)"
@@ -127,6 +135,7 @@ impl fmt::Display for SortKey {
             Field::Text => "text",
             Field::Priority => "priority",
             Field::Due => "due",
+            Field::Project => "project",
         };
         match self.dir {
             Dir::Asc => write!(f, "{field}"),
@@ -143,6 +152,7 @@ struct Task {
     created: Option<String>,
     priority: Option<char>,
     due: Option<String>,
+    projects: Vec<String>,
     text: String,
 }
 
@@ -202,6 +212,11 @@ fn parse(line: &str) -> Task {
     }
 
     task.text = rest.trim().to_string();
+    task.projects = rest
+        .split_whitespace()
+        .filter(|t| t.len() > 1 && t.starts_with('+'))
+        .map(String::from)
+        .collect();
     task.due = rest
         .split_whitespace()
         .find(|t| t.to_ascii_lowercase().starts_with("due:"))
@@ -230,6 +245,11 @@ fn cmp_field(a: &Task, b: &Task, field: Field, collator: &mut Collator) -> Order
         Field::Text => collator.collate(&a.text, &b.text),
         Field::Priority => cmp_opt(a.priority, b.priority),
         Field::Due => cmp_opt(a.due.clone(), b.due.clone()),
+        // first +project tag groups tasks; untagged sink to the end
+        Field::Project => cmp_opt(
+            a.projects.first().map(|p| p.to_lowercase()),
+            b.projects.first().map(|p| p.to_lowercase()),
+        ),
     }
 }
 
@@ -248,9 +268,11 @@ fn sort_tasks(tasks: &mut [Task], keys: &[SortKey], collator: &mut Collator) {
     });
 }
 
-const DEFAULT_KEYS: [SortKey; 2] = [
+const DEFAULT_KEYS: [SortKey; 4] = [
     SortKey { field: Field::Completed, dir: Dir::Asc },
-    SortKey { field: Field::Text, dir: Dir::Asc },
+    SortKey { field: Field::Priority, dir: Dir::Asc },
+    SortKey { field: Field::Project, dir: Dir::Asc },
+    SortKey { field: Field::Timestamp, dir: Dir::Desc },
 ];
 
 /// key:value tokens that are recognized as todo.txt extension tags and
@@ -311,15 +333,17 @@ impl Task {
     }
 }
 
-fn apply(input: &str, keys: &[SortKey], reverse: bool, no_format_lines: bool) -> String {
+fn apply(input: &str, keys: &[SortKey], reverse: bool, no_format_lines: bool, no_sort: bool) -> String {
     let mut tasks: Vec<Task> = input
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(parse)
         .collect();
 
-    let mut collator = Collator::new(Tailoring::default(), true, true);
-    sort_tasks(&mut tasks, keys, &mut collator);
+    if !no_sort {
+        let mut collator = Collator::new(Tailoring::default(), true, true);
+        sort_tasks(&mut tasks, keys, &mut collator);
+    }
 
     if reverse {
         tasks.reverse();
@@ -360,7 +384,7 @@ fn run(cli: &Cli) -> Result<(String, String), String> {
     } else {
         &cli.sort
     };
-    let output = apply(&input, keys, cli.reverse, cli.no_format_lines);
+    let output = apply(&input, keys, cli.reverse, cli.no_format_lines, cli.no_sort);
     Ok((input, output))
 }
 
@@ -449,10 +473,12 @@ mod tests {
 
     #[test]
     fn default_puts_open_first_then_done() {
+        // undated open tasks keep capture order, done tasks order by completion
+        // date, newest first (freshly checked-off tasks stay near the top)
         let input = "x 2026-10-08 old task\nzebra\napple\nx 2026-10-07 alpha done";
         assert_eq!(
             sorted(input, &[]),
-            vec!["apple", "zebra", "x 2026-10-07 alpha done", "x 2026-10-08 old task"]
+            vec!["zebra", "apple", "x 2026-10-08 old task", "x 2026-10-07 alpha done"]
         );
     }
 
@@ -551,7 +577,7 @@ mod tests {
     }
 
     fn formatted(input: &str) -> String {
-        apply(input, &DEFAULT_KEYS, false, false)
+        apply(input, &DEFAULT_KEYS, false, false, false)
     }
 
     #[test]
@@ -576,7 +602,7 @@ mod tests {
 
     #[test]
     fn no_format_lines_leaves_lines_untouched() {
-        let out = apply("buy @b +z milk\n", &DEFAULT_KEYS, false, true);
+        let out = apply("buy @b +z milk\n", &DEFAULT_KEYS, false, true, false);
         assert_eq!(out, "buy @b +z milk\n");
     }
 
@@ -593,8 +619,34 @@ mod tests {
             &DEFAULT_KEYS,
             false,
             true,
+            false,
         );
         assert_eq!(out, "(A) open @b one\nx 2026-10-08 (A) done @a\n");
+    }
+
+    #[test]
+    fn default_tiers_by_prio_then_project() {
+        let out = formatted(
+            "(B) b-task +zeta\nplain task\n(A) a-task +alpha\n2026-10-01 alte sache +zeta\nzeta-tagged +zeta\n",
+        );
+        // timestamp:desc → undated (fresh captures) float above dated ones
+        assert_eq!(
+            out,
+            "(A) a-task +alpha\n(B) b-task +zeta\nzeta-tagged +zeta\n2026-10-01 alte sache +zeta\nplain task\n"
+        );
+    }
+
+    #[test]
+    fn project_key_groups_tags() {
+        let keys = [key("project"), key("text")];
+        let out = apply("task +zebra\napple +alpha\nbanana\n", &keys, false, false, false);
+        assert_eq!(out, "apple +alpha\ntask +zebra\nbanana\n");
+    }
+
+    #[test]
+    fn no_sort_preserves_capture_order() {
+        let out = apply("z task\na task +z +a\n", &DEFAULT_KEYS, false, false, true);
+        assert_eq!(out, "z task\na task +a +z\n");
     }
 
     #[test]

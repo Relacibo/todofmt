@@ -50,7 +50,8 @@ todofmt [OPTIONEN] [DATEI]        # ohne DATEI: stdin → stdout (Filter-Style)
 
 | Flag | Wirkung |
 |---|---|
-| `-s, --sort KEY[:DIR]` | Sortierkey(s), wiederholbar und/oder kommasepariert. Reihenfolge = Priorität. `DIR` = `asc` (Default) oder `desc` |
+| `-s, --sort KEY[:DIR]` | Sortierkey(s), wiederholbar und/oder kommasepariert. Reihenfolge = Priorität. `DIR` = `asc` (Default) oder `desc`. Überschreibt die Default-Kette komplett |
+| `--no-sort` | Keine Zeilenreihenfolge; nur Normalisierung (mit `--no-format-lines`: gar nichts) |
 | `--no-format-lines` | Nur Zeilenreihenfolge ändern; Zeileninhalt byte-genau lassen (auch kein Prio-Stripping) |
 | `-r, --reverse` | Dreht das Endergebnis um |
 | `-c, --check` | Prüft nur: Exit 0 wenn bereits in Zielform, Exit 1 sonst (silent bei Erfolg). Für Pre-Commit-Hooks/CI; unvereinbar mit `--in-place` |
@@ -68,8 +69,19 @@ erledigte versickern unten.
 | `text` | `alphabetical`, `alphabetically`, `alpha`, `name` | Task-Text (Unicode-Collation via `feruca` — `Ärzte` sortiert bei `apfel`, nicht hinter `Zebra`) |
 | `priority` | `prio` | `(A)`–`(Z)`, ohne Prio nach hinten |
 | `due` | — | `due:YYYY-MM-DD` im Text, ohne nach hinten |
+| `project` | `projects`, `tag`, `tags` | Erstes `+projekt`-Tag (Gruppierung), ohne Tag nach hinten |
 
-Stable Sort: Zeilen mit gleichen Keys behalten ihre Eingabe-Reihenfolge.
+Ohne `--sort` gilt: `completed,priority,project,timestamp:desc` — erledigte Tasks
+unten, dann Prio-Tiers `(A)`→`(Z)`→ohne, darin Gruppen nach `+tag`, am Ende
+nach Datum (Neuestes zuerst, Undatiertes davor; bei Gleichstand zählt die
+Eingabe-Reihenfolge). Alphabetisch sortiert wird nur auf expliziten Wunsch
+(`-s text`) — innerhalb einer Textzeile bleibt alles unangetastet.
+
+Die Default-Kette lässt sich 1:1 als explizites Komma-Argument schreiben:
+
+```sh
+todofmt -s completed,priority,project,timestamp:desc todo.txt
+```
 
 ### Normalisierung (Default an, `--no-format-lines` schaltet ab)
 
