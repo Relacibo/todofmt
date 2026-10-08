@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     fmt, io,
     io::{Read, Write},
@@ -144,16 +145,19 @@ impl fmt::Display for SortKey {
     }
 }
 
+/// A parsed task line. Borrows from the input buffer where possible
+/// (zero-copy); only normalization produces owned output.
 #[derive(Debug, Default)]
-struct Task {
-    raw: String,
+struct Task<'a> {
+    raw: Cow<'a, str>,
+    indent: &'a str,
     completed: bool,
-    completion: Option<String>,
-    created: Option<String>,
+    completion: Option<&'a str>,
+    created: Option<&'a str>,
     priority: Option<char>,
-    due: Option<String>,
-    projects: Vec<String>,
-    text: String,
+    due: Option<&'a str>,
+    projects: Vec<&'a str>,
+    text: &'a str,
 }
 
 fn is_date(s: &str) -> bool {
@@ -175,9 +179,9 @@ fn priority_of(s: &str) -> Option<char> {
     }
 }
 
-fn parse(line: &str) -> Task {
+fn parse(line: &'_ str) -> Task<'_> {
     let mut task = Task {
-        raw: line.to_string(),
+        raw: Cow::Borrowed(line),
         ..Task::default()
     };
     let mut rest = line;
@@ -197,13 +201,13 @@ fn parse(line: &str) -> Task {
             task.priority = priority_of(tok);
             rest = &trimmed[tok.len()..];
         } else if is_date(tok) && task.completion.is_none() && task.completed {
-            task.completion = Some(tok.to_string());
+            task.completion = Some(tok);
             rest = &trimmed[tok.len()..];
         } else if is_date(tok)
             && task.created.is_none()
             && (task.completion.is_some() || !task.completed)
         {
-            task.created = Some(tok.to_string());
+            task.created = Some(tok);
             rest = &trimmed[tok.len()..];
         } else {
             break;
@@ -211,16 +215,15 @@ fn parse(line: &str) -> Task {
         first = false;
     }
 
-    task.text = rest.trim().to_string();
+    task.text = rest.trim();
     task.projects = rest
         .split_whitespace()
         .filter(|t| t.len() > 1 && t.starts_with('+'))
-        .map(String::from)
         .collect();
     task.due = rest
         .split_whitespace()
         .find(|t| t.to_ascii_lowercase().starts_with("due:"))
-        .map(|t| t[4..].to_string());
+        .map(|t| &t[4..]);
     task
 }
 
@@ -233,39 +236,42 @@ fn cmp_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Ordering {
     }
 }
 
+fn cmp_opt_by<T>(a: Option<T>, b: Option<T>, f: impl Fn(&T, &T) -> Ordering) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => f(&x, &y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn cmp_field(a: &Task, b: &Task, field: Field, collator: &mut Collator) -> Ordering {
     match field {
         // asc: open tasks (false) before completed (true)
         Field::Completed => a.completed.cmp(&b.completed),
         // completion date on done lines, created date otherwise
-        Field::Timestamp => cmp_opt(
-            a.completion.as_ref().or(a.created.as_ref()),
-            b.completion.as_ref().or(b.created.as_ref()),
-        ),
+        Field::Timestamp => cmp_opt(a.completion.or(a.created), b.completion.or(b.created)),
         Field::Text => collator.collate(&a.text, &b.text),
         Field::Priority => cmp_opt(a.priority, b.priority),
-        Field::Due => cmp_opt(a.due.clone(), b.due.clone()),
+        Field::Due => cmp_opt(a.due, b.due),
         // first +project tag groups tasks; untagged sink to the end
-        Field::Project => cmp_opt(
-            a.projects.first().map(|p| p.to_lowercase()),
-            b.projects.first().map(|p| p.to_lowercase()),
-        ),
+        Field::Project => cmp_opt_by(a.projects.first(), b.projects.first(), |x, y| {
+            cmp_ignore_case(x, y)
+        }),
     }
 }
 
-fn sort_tasks(tasks: &mut [Task], keys: &[SortKey], collator: &mut Collator) {
-    tasks.sort_by(|a, b| {
-        for key in keys {
-            let mut ord = cmp_field(a, b, key.field, collator);
-            if key.dir == Dir::Desc {
-                ord = ord.reverse();
-            }
-            if ord != Ordering::Equal {
-                return ord;
-            }
+fn cmp_keys(a: &Task, b: &Task, keys: &[SortKey], collator: &mut Collator) -> Ordering {
+    for key in keys {
+        let mut ord = cmp_field(a, b, key.field, collator);
+        if key.dir == Dir::Desc {
+            ord = ord.reverse();
         }
-        Ordering::Equal
-    });
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 const DEFAULT_KEYS: [SortKey; 4] = [
@@ -280,28 +286,39 @@ const DEFAULT_KEYS: [SortKey; 4] = [
 /// anything else (URLs, times like 12:30) stays in the text.
 const SPECIAL_KEYS: [&str; 6] = ["due:", "t:", "thresh:", "pri:", "h:", "rec:"];
 
-fn split_tags(text: &str) -> (Vec<&str>, Vec<String>, Vec<String>, Vec<String>) {
+fn cmp_ignore_case(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        // fast path: byte-level fold, no Unicode tables, no allocations
+        a.bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
+fn split_tags(text: &str) -> (Vec<&str>, Vec<&str>, Vec<&str>, Vec<&str>) {
     let mut core = Vec::new();
     let (mut projects, mut contexts, mut kvs) = (Vec::new(), Vec::new(), Vec::new());
     for tok in text.split_whitespace() {
         let lower = tok.to_ascii_lowercase();
         if tok.len() > 1 && tok.starts_with('+') {
-            projects.push(tok.to_string());
+            projects.push(tok);
         } else if tok.len() > 1 && tok.starts_with('@') {
-            contexts.push(tok.to_string());
+            contexts.push(tok);
         } else if SPECIAL_KEYS.iter().any(|k| lower.starts_with(k)) {
-            kvs.push(tok.to_string());
+            kvs.push(tok);
         } else {
             core.push(tok);
         }
     }
-    projects.sort_by_key(|t| t.to_lowercase());
-    contexts.sort_by_key(|t| t.to_lowercase());
-    kvs.sort_by_key(|t| t.to_lowercase());
+    projects.sort_by(|a, b| cmp_ignore_case(a, b));
+    contexts.sort_by(|a, b| cmp_ignore_case(a, b));
+    kvs.sort_by(|a, b| cmp_ignore_case(a, b));
     (core, projects, contexts, kvs)
 }
 
-impl Task {
+impl Task<'_> {
     /// Canonical line form (todo.sh de-facto order):
     /// x, done-date, (prio), created-date, text, +projects, @contexts, key:values.
     /// Completed tasks lose their priority (spec hygiene — keeps the active
@@ -312,17 +329,17 @@ impl Task {
         if self.completed {
             parts.push("x".to_string());
         }
-        if let Some(d) = &self.completion {
-            parts.push(d.clone());
+        if let Some(d) = self.completion {
+            parts.push(d.to_string());
         }
         if let Some(p) = self.priority.filter(|_| !self.completed) {
             parts.push(format!("({p})"));
         }
-        if let Some(d) = &self.created {
-            parts.push(d.clone());
+        if let Some(d) = self.created {
+            parts.push(d.to_string());
         }
-        let (core, projects, contexts, kvs) = split_tags(&self.text);
-        let mut text: Vec<String> = core.into_iter().map(String::from).collect();
+        let (core, projects, contexts, kvs) = split_tags(self.text);
+        let mut text: Vec<&str> = core;
         text.extend(projects);
         text.extend(contexts);
         text.extend(kvs);
@@ -333,31 +350,47 @@ impl Task {
     }
 }
 
-fn apply(input: &str, keys: &[SortKey], reverse: bool, no_format_lines: bool, no_sort: bool) -> String {
-    let mut tasks: Vec<Task> = input
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(parse)
-        .collect();
-
-    if !no_sort {
-        let mut collator = Collator::new(Tailoring::default(), true, true);
-        sort_tasks(&mut tasks, keys, &mut collator);
-    }
-
-    if reverse {
-        tasks.reverse();
-    }
-
-    if !no_format_lines {
-        for t in &mut tasks {
-            t.raw = t.canonical();
+fn apply<'a>(
+    input: &'a str,
+    keys: &[SortKey],
+    reverse: bool,
+    no_format_lines: bool,
+    no_sort: bool,
+) -> String {
+    // Markor/Simpletask subtask convention: indented lines belong to the
+    // nearest unindented line above them. Sorting operates on those blocks;
+    // children keep their capture order inside the block.
+    let mut blocks: Vec<Vec<Task<'a>>> = Vec::new();
+    for line in input.lines().filter(|l| !l.trim().is_empty()) {
+        let idx = line.find(|c: char| !c.is_whitespace()).unwrap_or(line.len());
+        let (indent, content) = (&line[..idx], &line[idx..]);
+        let mut task = parse(content);
+        task.indent = indent;
+        task.raw = Cow::Borrowed(line);
+        match blocks.last_mut() {
+            Some(block) if !indent.is_empty() => block.push(task),
+            _ => blocks.push(vec![task]),
         }
     }
 
-    let mut out = tasks
+    if !no_sort {
+        let mut collator = Collator::new(Tailoring::default(), true, true);
+        blocks.sort_by(|a, b| cmp_keys(&a[0], &b[0], keys, &mut collator));
+    }
+
+    if reverse {
+        blocks.reverse();
+    }
+
+    let mut out = blocks
         .into_iter()
-        .map(|t| t.raw)
+        .flatten()
+        .map(|mut t| {
+            if !no_format_lines {
+                t.raw = Cow::Owned(format!("{}{}", t.indent, t.canonical()));
+            }
+            t.raw
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if !out.is_empty() {
@@ -436,10 +469,10 @@ mod tests {
 
     fn sorted(input: &str, keys: &[SortKey]) -> Vec<String> {
         let keys: &[SortKey] = if keys.is_empty() { &DEFAULT_KEYS } else { keys };
-        let mut tasks: Vec<Task> = input.lines().map(parse).collect();
-        let mut collator = Collator::new(Tailoring::default(), true, true);
-        sort_tasks(&mut tasks, keys, &mut collator);
-        tasks.into_iter().map(|t| t.raw).collect()
+        apply(input, keys, false, true, false)
+            .lines()
+            .map(String::from)
+            .collect()
     }
 
     fn key(spec: &str) -> SortKey {
@@ -526,14 +559,8 @@ mod tests {
         let input = "apple\nbanana";
         let keys = &[key("text")];
         assert_eq!(sorted(input, keys), vec!["apple", "banana"]);
-        let mut tasks: Vec<Task> = input.lines().map(parse).collect();
-        let mut collator = Collator::new(Tailoring::default(), true, true);
-        sort_tasks(&mut tasks, keys, &mut collator);
-        tasks.reverse();
-        assert_eq!(
-            tasks.into_iter().map(|t| t.raw).collect::<Vec<_>>(),
-            vec!["banana", "apple"]
-        );
+        let out = apply(input, keys, true, true, false);
+        assert_eq!(out, "banana\napple\n");
     }
 
     #[test]
@@ -647,6 +674,30 @@ mod tests {
     fn no_sort_preserves_capture_order() {
         let out = apply("z task\na task +z +a\n", &DEFAULT_KEYS, false, false, true);
         assert_eq!(out, "z task\na task +a +z\n");
+    }
+
+    #[test]
+    fn subtasks_stay_with_parent_when_sorting() {
+        let out = formatted("z-parent +zeta\n    z-child\na-parent +alpha\n    a-child\n");
+        assert_eq!(out, "a-parent +alpha\n    a-child\nz-parent +zeta\n    z-child\n");
+    }
+
+    #[test]
+    fn child_lines_normalized_with_indent_preserved() {
+        let out = formatted("parent @b +a\n    child done @x +y\n");
+        assert_eq!(out, "parent +a @b\n    child done +y @x\n");
+    }
+
+    #[test]
+    fn reverse_flips_blocks_not_children() {
+        let out = apply(
+            "one\n    one-child\ntwo\n    two-child\n",
+            &[],
+            true,
+            true,
+            false,
+        );
+        assert_eq!(out, "two\n    two-child\none\n    one-child\n");
     }
 
     #[test]

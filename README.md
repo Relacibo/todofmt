@@ -109,6 +109,21 @@ Root-Collation behandelt Groß-/Kleinschreibung richtig) und granulare
 Tags-Flags (`--sort-tags` o.ä.) — Formatter haben *eine* kanonische Meinung,
 keine Kompositions-Flags.
 
+### Subtasks (Markor/Simpletask-Konvention)
+
+Eingerückte Zeilen gehören zum darüberliegenden Elternteil (so rendert es
+Markor). todofmt behandelt sie als **Blöcke**:
+
+- Sortiert wird Block-weise nach den Keys des Elternteils — Kinder wandern
+  nie von ihrem Parent weg, egal welche Keys greifen
+- Kinder behalten ihre Erfassungs-Reihenfolge innerhalb des Blocks
+- Normalisierung gilt auch für Kinder (kanonische Form, Tags, Prio-Strip
+  bei `x`-Zeilen) — die **Einrückung bleibt byte-genau** erhalten
+- `--reverse` dreht Block-Reihenfolge, nicht Block-Inhalt
+
+Kein Flag nötig: flache Dateien verhalten sich exakt wie vorher, eingerückte
+Zeilen gibt es nur, wenn sie bewusst Struktur sind.
+
 ### Beispiele
 
 ```sh
