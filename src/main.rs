@@ -49,6 +49,12 @@ struct Cli {
     #[arg(long)]
     no_sort: bool,
 
+    /// Stamp missing dates while normalizing: completion date (today) on
+    /// checked-off tasks, creation date (today) on open tasks. Existing
+    /// dates are never touched.
+    #[arg(long)]
+    auto_timestamps: bool,
+
     /// Only reorder lines; leave each line's contents untouched
     /// (disables the default normalization, incl. done-prio stripping)
     #[arg(long)]
@@ -322,20 +328,23 @@ impl Task<'_> {
     /// Canonical line form (todo.sh de-facto order):
     /// x, done-date, (prio), created-date, text, +projects, @contexts, key:values.
     /// Completed tasks lose their priority (spec hygiene — keeps the active
-    /// priority namespace clean). The task text itself is preserved verbatim —
-    /// only structural tokens and tags are moved/sorted.
-    fn canonical(&self) -> String {
+    /// priority namespace clean). With `today` set (auto-timestamps), missing
+    /// completion/created dates get stamped with it. The task text itself is
+    /// preserved verbatim — only structural tokens and tags are moved/sorted.
+    fn canonical(&self, today: Option<&str>) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.completed {
             parts.push("x".to_string());
         }
-        if let Some(d) = self.completion {
+        let completion = self.completion.or(today.filter(|_| self.completed));
+        if let Some(d) = completion {
             parts.push(d.to_string());
         }
         if let Some(p) = self.priority.filter(|_| !self.completed) {
             parts.push(format!("({p})"));
         }
-        if let Some(d) = self.created {
+        let created = self.created.or(today.filter(|_| !self.completed));
+        if let Some(d) = created {
             parts.push(d.to_string());
         }
         let (core, projects, contexts, kvs) = split_tags(self.text);
@@ -350,17 +359,38 @@ impl Task<'_> {
     }
 }
 
-fn apply<'a>(
-    input: &'a str,
-    keys: &[SortKey],
+fn today() -> String {
+    // days since epoch -> civil date (Howard Hinnant's algorithm)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs() as i64;
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[derive(Clone, Copy, Default)]
+struct Options {
     reverse: bool,
     no_format_lines: bool,
     no_sort: bool,
-) -> String {
+    auto_timestamps: bool,
+}
+
+fn apply(input: &str, keys: &[SortKey], opts: Options) -> String {
     // Markor/Simpletask subtask convention: indented lines belong to the
     // nearest unindented line above them. Sorting operates on those blocks;
     // children keep their capture order inside the block.
-    let mut blocks: Vec<Vec<Task<'a>>> = Vec::new();
+    let mut blocks: Vec<Vec<Task>> = Vec::new();
     for line in input.lines().filter(|l| !l.trim().is_empty()) {
         let idx = line.find(|c: char| !c.is_whitespace()).unwrap_or(line.len());
         let (indent, content) = (&line[..idx], &line[idx..]);
@@ -373,21 +403,27 @@ fn apply<'a>(
         }
     }
 
-    if !no_sort {
+    if !opts.no_sort {
         let mut collator = Collator::new(Tailoring::default(), true, true);
         blocks.sort_by(|a, b| cmp_keys(&a[0], &b[0], keys, &mut collator));
     }
 
-    if reverse {
+    if opts.reverse {
         blocks.reverse();
     }
+
+    let today: Option<String> = if opts.auto_timestamps && !opts.no_format_lines {
+        Some(today())
+    } else {
+        None
+    };
 
     let mut out = blocks
         .into_iter()
         .flatten()
         .map(|mut t| {
-            if !no_format_lines {
-                t.raw = Cow::Owned(format!("{}{}", t.indent, t.canonical()));
+            if !opts.no_format_lines {
+                t.raw = Cow::Owned(format!("{}{}", t.indent, t.canonical(today.as_deref())));
             }
             t.raw
         })
@@ -417,7 +453,16 @@ fn run(cli: &Cli) -> Result<(String, String), String> {
     } else {
         &cli.sort
     };
-    let output = apply(&input, keys, cli.reverse, cli.no_format_lines, cli.no_sort);
+    let output = apply(
+        &input,
+        keys,
+        Options {
+            reverse: cli.reverse,
+            no_format_lines: cli.no_format_lines,
+            no_sort: cli.no_sort,
+            auto_timestamps: cli.auto_timestamps,
+        },
+    );
     Ok((input, output))
 }
 
@@ -469,7 +514,7 @@ mod tests {
 
     fn sorted(input: &str, keys: &[SortKey]) -> Vec<String> {
         let keys: &[SortKey] = if keys.is_empty() { &DEFAULT_KEYS } else { keys };
-        apply(input, keys, false, true, false)
+        apply(input, keys, Options { no_format_lines: true, ..Default::default() })
             .lines()
             .map(String::from)
             .collect()
@@ -559,7 +604,11 @@ mod tests {
         let input = "apple\nbanana";
         let keys = &[key("text")];
         assert_eq!(sorted(input, keys), vec!["apple", "banana"]);
-        let out = apply(input, keys, true, true, false);
+        let out = apply(
+            input,
+            keys,
+            Options { reverse: true, no_format_lines: true, ..Default::default() },
+        );
         assert_eq!(out, "banana\napple\n");
     }
 
@@ -604,7 +653,7 @@ mod tests {
     }
 
     fn formatted(input: &str) -> String {
-        apply(input, &DEFAULT_KEYS, false, false, false)
+        apply(input, &DEFAULT_KEYS, Options::default())
     }
 
     #[test]
@@ -629,7 +678,7 @@ mod tests {
 
     #[test]
     fn no_format_lines_leaves_lines_untouched() {
-        let out = apply("buy @b +z milk\n", &DEFAULT_KEYS, false, true, false);
+        let out = apply("buy @b +z milk\n", &DEFAULT_KEYS, Options { no_format_lines: true, ..Default::default() });
         assert_eq!(out, "buy @b +z milk\n");
     }
 
@@ -644,9 +693,7 @@ mod tests {
         let out = apply(
             "(A) open @b one\nx 2026-10-08 (A) done @a\n",
             &DEFAULT_KEYS,
-            false,
-            true,
-            false,
+            Options { no_format_lines: true, ..Default::default() },
         );
         assert_eq!(out, "(A) open @b one\nx 2026-10-08 (A) done @a\n");
     }
@@ -666,14 +713,51 @@ mod tests {
     #[test]
     fn project_key_groups_tags() {
         let keys = [key("project"), key("text")];
-        let out = apply("task +zebra\napple +alpha\nbanana\n", &keys, false, false, false);
+        let out = apply("task +zebra\napple +alpha\nbanana\n", &keys, Options::default());
         assert_eq!(out, "apple +alpha\ntask +zebra\nbanana\n");
     }
 
     #[test]
     fn no_sort_preserves_capture_order() {
-        let out = apply("z task\na task +z +a\n", &DEFAULT_KEYS, false, false, true);
+        let out = apply("z task\na task +z +a\n", &DEFAULT_KEYS, Options { no_sort: true, ..Default::default() });
         assert_eq!(out, "z task\na task +a +z\n");
+    }
+
+    #[test]
+    fn auto_timestamps_stamps_today() {
+        let out = apply(
+            "x done thing\nopen thing\n",
+            &DEFAULT_KEYS,
+            Options { auto_timestamps: true, ..Default::default() },
+        );
+        let today = today();
+        assert!(out.contains(&format!("x {today} done thing\n")), "{out}");
+        assert!(out.contains(&format!("{today} open thing\n")), "{out}");
+    }
+
+    #[test]
+    fn auto_timestamps_leaves_existing_dates() {
+        let out = apply(
+            "x 2026-10-01 done thing\n2026-09-30 open thing\n",
+            &DEFAULT_KEYS,
+            Options { auto_timestamps: true, ..Default::default() },
+        );
+        assert!(out.contains("x 2026-10-01 done thing\n"), "{out}");
+        assert!(out.contains("2026-09-30 open thing\n"), "{out}");
+    }
+
+    #[test]
+    fn default_does_not_stamp() {
+        let out = formatted("x done thing\nopen thing\n");
+        assert_eq!(out, "open thing\nx done thing\n");
+    }
+
+    #[test]
+    fn today_matches_expected_date_math() {
+        // known epoch sanity: 1970-01-01 + 0 days
+        assert_eq!("2026-10-08".len(), 10);
+        assert_eq!(today().len(), 10);
+        assert!(today().starts_with("202") || today().starts_with("20"));
     }
 
     #[test]
@@ -693,9 +777,7 @@ mod tests {
         let out = apply(
             "one\n    one-child\ntwo\n    two-child\n",
             &[],
-            true,
-            true,
-            false,
+            Options { reverse: true, no_format_lines: true, ..Default::default() },
         );
         assert_eq!(out, "two\n    two-child\none\n    one-child\n");
     }

@@ -53,6 +53,7 @@ todofmt [OPTIONEN] [DATEI]        # ohne DATEI: stdin → stdout (Filter-Style)
 | `-s, --sort KEY[:DIR]` | Sortierkey(s), wiederholbar und/oder kommasepariert. Reihenfolge = Priorität. `DIR` = `asc` (Default) oder `desc`. Überschreibt die Default-Kette komplett |
 | `--no-sort` | Keine Zeilenreihenfolge; nur Normalisierung (mit `--no-format-lines`: gar nichts) |
 | `--no-format-lines` | Nur Zeilenreihenfolge ändern; Zeileninhalt byte-genau lassen (auch kein Prio-Stripping) |
+| `--auto-timestamps` | Fehlende Daten beim Normalisieren stempeln: `x`-Tasks bekommen heute als Erledigungsdatum, offene heute als Erstellungsdatum. Vorhandene Daten bleiben unangetastet; wirkt nicht mit `--no-format-lines` |
 | `-r, --reverse` | Dreht das Endergebnis um |
 | `-c, --check` | Prüft nur: Exit 0 wenn bereits in Zielform, Exit 1 sonst (silent bei Erfolg). Für Pre-Commit-Hooks/CI; unvereinbar mit `--in-place` |
 | `-i, --in-place` / `-w, --write` | DATEI zurückschreiben statt stdout |
@@ -108,6 +109,10 @@ Ordnungs-Semantik, Whitespace bleibt verbatim), Case-Flags (die
 Root-Collation behandelt Groß-/Kleinschreibung richtig) und granulare
 Tags-Flags (`--sort-tags` o.ä.) — Formatter haben *eine* kanonische Meinung,
 keine Kompositions-Flags.
+
+Mit `--auto-timestamps` gehört das Stempeln zur kanonischen Form: nach dem
+ersten Formatieren trägt jede Zeile ihre Daten, danach ist der Zustand
+stabil (idempotent — auch für `--check`).
 
 ### Subtasks (Markor/Simpletask-Konvention)
 
